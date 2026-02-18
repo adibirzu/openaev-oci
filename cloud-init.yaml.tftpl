@@ -1,0 +1,217 @@
+#!/bin/bash
+set -e
+
+# ── Disable security components for lab environment ──
+setenforce 0 2>/dev/null || true
+sed -i 's/^SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config 2>/dev/null || true
+systemctl stop firewalld 2>/dev/null || true
+systemctl disable firewalld 2>/dev/null || true
+systemctl stop packagekit 2>/dev/null || true
+systemctl disable packagekit 2>/dev/null || true
+
+# ── Install Docker CE ──
+dnf install -y dnf-utils
+dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+systemctl enable docker
+systemctl start docker
+
+# ── Resolve VM private IP ──
+MY_IP=$(ip -4 route get 1 | awk '{print $7; exit}')
+if [[ -z "$MY_IP" ]]; then
+    MY_IP=$(hostname -I | awk '{print $1}')
+fi
+
+# ── Create OpenAEV directory ──
+mkdir -p /opt/openaev
+
+# ── Create .env file ──
+cat > /opt/openaev/.env <<EOF
+OPENAEV_ADMIN_EMAIL=${openaev_admin_email}
+OPENAEV_ADMIN_PASSWORD=${openaev_admin_password}
+OPENAEV_ADMIN_TOKEN=${openaev_admin_token}
+OPENAEV_BASE_URL=http://$MY_IP:8080
+POSTGRES_DB=openaev
+POSTGRES_USER=openaev
+POSTGRES_PASSWORD=${pg_password}
+ELASTIC_PASSWORD=${es_password}
+RABBITMQ_DEFAULT_USER=openaev
+RABBITMQ_DEFAULT_PASS=${rabbitmq_password}
+MINIO_ROOT_USER=openaev
+MINIO_ROOT_PASSWORD=${minio_password}
+INJECTOR_CALDERA_ENABLE=true
+INJECTOR_CALDERA_URL=${caldera_url}
+INJECTOR_CALDERA_API_KEY=${caldera_api_key}
+EXECUTOR_CALDERA_ENABLE=true
+EXECUTOR_CALDERA_URL=${caldera_url}
+EXECUTOR_CALDERA_API_KEY=${caldera_api_key}
+EOF
+
+# ── Create docker-compose.yml ──
+cat > /opt/openaev/docker-compose.yml <<'COMPOSE'
+services:
+  pgsql:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: $${POSTGRES_DB}
+      POSTGRES_USER: $${POSTGRES_USER}
+      POSTGRES_PASSWORD: $${POSTGRES_PASSWORD}
+    volumes:
+      - pgsql_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    environment:
+      MINIO_ROOT_USER: $${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: $${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+
+  rabbitmq:
+    image: rabbitmq:4.0-management
+    environment:
+      RABBITMQ_DEFAULT_USER: $${RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: $${RABBITMQ_DEFAULT_PASS}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_running"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  openaev:
+    image: filigran/openaev:2.1.8
+    environment:
+      - NODE_OPTIONS=--max-old-space-size=4096
+      - APP__BASE_URL=$${OPENAEV_BASE_URL}
+      - APP__ADMIN__EMAIL=$${OPENAEV_ADMIN_EMAIL}
+      - APP__ADMIN__PASSWORD=$${OPENAEV_ADMIN_PASSWORD}
+      - APP__ADMIN__TOKEN=$${OPENAEV_ADMIN_TOKEN}
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://pgsql:5432/$${POSTGRES_DB}
+      - SPRING_DATASOURCE_USERNAME=$${POSTGRES_USER}
+      - SPRING_DATASOURCE_PASSWORD=$${POSTGRES_PASSWORD}
+      - OPENAEV_ELASTICSEARCH_URL=http://elasticsearch:9200
+      - OPENAEV_RABBITMQ_HOSTNAME=rabbitmq
+      - OPENAEV_RABBITMQ_PORT=5672
+      - OPENAEV_RABBITMQ_USER=$${RABBITMQ_DEFAULT_USER}
+      - OPENAEV_RABBITMQ_PASS=$${RABBITMQ_DEFAULT_PASS}
+      - OPENAEV_S3_ENDPOINT=http://minio:9000
+      - OPENAEV_S3_ACCESS_KEY=$${MINIO_ROOT_USER}
+      - OPENAEV_S3_SECRET_KEY=$${MINIO_ROOT_PASSWORD}
+      - INJECTOR_CALDERA_ENABLE=$${INJECTOR_CALDERA_ENABLE}
+      - INJECTOR_CALDERA_URL=$${INJECTOR_CALDERA_URL}
+      - INJECTOR_CALDERA_API_KEY=$${INJECTOR_CALDERA_API_KEY}
+      - EXECUTOR_CALDERA_ENABLE=$${EXECUTOR_CALDERA_ENABLE}
+      - EXECUTOR_CALDERA_URL=$${EXECUTOR_CALDERA_URL}
+      - EXECUTOR_CALDERA_API_KEY=$${EXECUTOR_CALDERA_API_KEY}
+    ports:
+      - "8080:8080"
+    depends_on:
+      pgsql:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+  collector-mitre-attack:
+    image: filigran/collector-mitre-attack:latest
+    environment:
+      - OPENAEV_URL=http://openaev:8080
+      - OPENAEV_TOKEN=$${OPENAEV_ADMIN_TOKEN}
+      - COLLECTOR_ID=collector-mitre-attack
+      - COLLECTOR_PERIOD=86400
+    depends_on:
+      - openaev
+    restart: unless-stopped
+
+  collector-atomic-red-team:
+    image: filigran/collector-atomic-red-team:latest
+    environment:
+      - OPENAEV_URL=http://openaev:8080
+      - OPENAEV_TOKEN=$${OPENAEV_ADMIN_TOKEN}
+      - COLLECTOR_ID=collector-atomic-red-team
+      - COLLECTOR_PERIOD=86400
+    depends_on:
+      - openaev
+    restart: unless-stopped
+
+  injector-nmap:
+    image: filigran/injector-nmap:latest
+    environment:
+      - OPENAEV_URL=http://openaev:8080
+      - OPENAEV_TOKEN=$${OPENAEV_ADMIN_TOKEN}
+    depends_on:
+      - openaev
+    restart: unless-stopped
+
+  injector-nuclei:
+    image: filigran/injector-nuclei:latest
+    environment:
+      - OPENAEV_URL=http://openaev:8080
+      - OPENAEV_TOKEN=$${OPENAEV_ADMIN_TOKEN}
+    depends_on:
+      - openaev
+    restart: unless-stopped
+
+volumes:
+  pgsql_data:
+  es_data:
+  minio_data:
+COMPOSE
+
+# ── Start OpenAEV stack ──
+cd /opt/openaev
+docker compose up -d
+
+# ── Create systemd unit for auto-start ──
+cat > /etc/systemd/system/openaev.service <<EOF
+[Unit]
+Description=OpenAEV Docker Compose Stack
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/openaev
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable openaev
