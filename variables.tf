@@ -87,3 +87,10 @@ variable "caldera_api_key" {
   type        = string
   sensitive   = true
 }
+
+# ─── Network Integration (GOADv3) ───
+variable "goad_subnet_id" {
+  description = "Subnet OCID for the GOADv3 lab for network integration"
+  type        = string
+  default     = ""
+}

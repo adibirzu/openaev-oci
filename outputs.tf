@@ -17,3 +17,9 @@ output "openaev_url" {
   description = "OpenAEV web URL"
   value       = "http://${data.oci_core_vnic.openaev.private_ip_address}:8080"
 }
+
+output "openaev_admin_token" {
+  description = "OpenAEV admin API token for OCI-DEMO integration"
+  value       = var.openaev_admin_token
+  sensitive   = true
+}

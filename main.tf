@@ -22,13 +22,50 @@ data "oci_core_images" "ol8" {
   sort_order               = "DESC"
 }
 
-# ─── Compute Instance ───
+data "oci_core_subnet" "openaev" {
+  subnet_id = var.subnet_id
+}
+
+# ─── Network Security ───
+
+resource "oci_core_network_security_group" "security_tools" {
+  compartment_id = var.compartment_id
+  vcn_id         = data.oci_core_subnet.openaev.vcn_id
+  display_name   = "nsg-security-tools"
+}
+
+# Rule for internal traffic between security tools
+resource "oci_core_network_security_group_security_rule" "internal_ingress" {
+  network_security_group_id = oci_core_network_security_group.security_tools.id
+  direction                 = "INGRESS"
+  protocol                  = "all"
+  source_type               = "NETWORK_SECURITY_GROUP"
+  source                    = oci_core_network_security_group.security_tools.id
+}
+
+# Rule for GOADv3 integration (allow all traffic from/to GOAD subnet if specified)
+resource "oci_core_network_security_group_security_rule" "goad_ingress" {
+  count                     = var.goad_subnet_id != "" ? 1 : 0
+  network_security_group_id = oci_core_network_security_group.security_tools.id
+  direction                 = "INGRESS"
+  protocol                  = "all"
+  source_type               = "CIDR_BLOCK"
+  source                    = data.oci_core_subnet.goad[0].cidr_block
+}
+
+data "oci_core_subnet" "goad" {
+  count     = var.goad_subnet_id != "" ? 1 : 0
+  subnet_id = var.goad_subnet_id
+}
+
+# ─── Compute Instance: OpenAEV ───
 
 resource "oci_core_instance" "openaev" {
   compartment_id      = var.compartment_id
   availability_domain = data.oci_identity_availability_domains.ads.availability_domains[0].name
   display_name        = var.display_name
   shape               = var.shape
+  freeform_tags       = { "OCI-DEMO" : "openaev-platform" }
 
   shape_config {
     ocpus         = var.ocpus
@@ -44,6 +81,7 @@ resource "oci_core_instance" "openaev" {
   create_vnic_details {
     subnet_id        = var.subnet_id
     assign_public_ip = false
+    nsg_ids          = [oci_core_network_security_group.security_tools.id]
   }
 
   metadata = {

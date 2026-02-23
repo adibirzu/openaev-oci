@@ -185,6 +185,17 @@ services:
       - openaev
     restart: unless-stopped
 
+  injector-caldera:
+    image: filigran/injector-caldera:latest
+    environment:
+      - OPENAEV_URL=http://openaev:8080
+      - OPENAEV_TOKEN=$${OPENAEV_ADMIN_TOKEN}
+      - CALDERA_URL=$${INJECTOR_CALDERA_URL}
+      - CALDERA_API_KEY=$${INJECTOR_CALDERA_API_KEY}
+    depends_on:
+      - openaev
+    restart: unless-stopped
+
 volumes:
   pgsql_data:
   es_data:
